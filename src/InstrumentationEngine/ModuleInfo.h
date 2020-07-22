@@ -18,7 +18,7 @@ namespace MicrosoftInstrumentationEngine
     class CProfilerManager;
 
     class __declspec(uuid("CDD3824F-B876-4450-9459-885BA1C21540"))
-    CModuleInfo : public IModuleInfo3, public CDataContainer
+    CModuleInfo : public IModuleInfo4, public CDataContainer
     {
     private:
         class CMethodKey
@@ -104,6 +104,7 @@ namespace MicrosoftInstrumentationEngine
         STDMETHOD(QueryInterface)(_In_ REFIID riid, _Out_ void **ppvObject) override
         {
             return ImplQueryInterface(
+                static_cast<IModuleInfo4*>(this),
                 static_cast<IModuleInfo3*>(this),
                 static_cast<IModuleInfo2*>(this),
                 static_cast<IModuleInfo*>(this),
@@ -230,6 +231,10 @@ namespace MicrosoftInstrumentationEngine
     public:
         virtual HRESULT __stdcall GetIsLoadedFromDisk(_Out_ BOOL* pbValue) override;
 
+        // IModuleInfo4
+    public:
+        // Import a type from the source module into the current one
+        virtual HRESULT __stdcall ImportType(_In_ LPCBYTE pSourceImage, _In_ DWORD sourceImageSize, _In_ MappingKind mapping, _In_ const WCHAR* typeName) override;
 
     private:
         HRESULT GetModuleTypeFlags();

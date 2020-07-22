@@ -976,6 +976,28 @@ library MicrosoftInstrumentationEngine
         HRESULT GetIsLoadedFromDisk([out] BOOL* pbValue);
     };
 
+    // logging levels in the instrumentation engine.
+    enum MappingKind
+    {
+        MappingKind_Image = 0x0,
+        MappingKind_Flat = 0x1
+    };
+
+    [
+        object,
+        uuid(A751B4C1-B03E-4790-8BB8-D86D7DF8DFF2),
+        pointer_default(unique)
+    ]
+    interface IModuleInfo4 : IModuleInfo3
+    {
+        HRESULT ImportType(
+            [in] LPCBYTE pSourceImage,
+            [in] DWORD sourceImageSize,
+            [in] enum MappingKind mapping,
+            [in] const WCHAR* typeName
+        );
+    };
+
     [
         object,
         uuid(683b3d0b-5cab-49ac-9242-c7de190c7764),

@@ -17,15 +17,21 @@ namespace MicrosoftInstrumentationEngine
     public:
         AssemblyInjector(_In_ ICorProfilerInfo2* pProfilerInfo,
             _In_ IMetaDataImport2* pSourceImport,
-            _In_ const LPCBYTE* pSourceImageBaseAddress,
+            _In_ LPCBYTE pSourceImageBaseAddress,
+            _In_ DWORD sourceImageSize,
+            _In_ MappingKind mapping,
             _In_ IMetaDataImport2* pTargetImport,
             _In_ IMetaDataEmit2* pTargetEmit,
             _In_ const ModuleID pTargetImage,
             _In_ IMethodMalloc* pTargetMethodMalloc);
 
         HRESULT ImportAll(bool importCustomAttributes = false);
+        HRESULT ImportType(_In_ const WCHAR* typeName);
 
     private:
+        HRESULT ReadModuleHeaders();
+        HRESULT ResolveRva(_In_ DWORD rva, _Out_ LPCBYTE* ppbResolvedAddress);
+        HRESULT EnsureSourceMetadataReader();
         HRESULT ImportTypeDef(_In_ const mdTypeDef sourceTypeDef, _Out_ mdTypeDef *pTargetTypeDef);
         HRESULT ImportTypeRef(_In_ const mdTypeRef sourceTypeRef, _Out_ mdToken *pTargetTypeRef);
         HRESULT ImportAssemblyRef(_In_ const mdAssemblyRef tkTypeRef, _Out_ mdToken *pTargetAssemblyRef);
@@ -86,8 +92,13 @@ namespace MicrosoftInstrumentationEngine
         ATL::CComPtr<IMetaDataEmit2> m_pTargetEmit;
         ATL::CComPtr<IMethodMalloc> m_pTargetMethodMalloc;
         ATL::CComPtr<ICorProfilerInfo2> m_pProfilerInfo;
-        const LPCBYTE* m_pSourceImageBaseAddress;
+        const LPCBYTE m_pSourceImageBaseAddress;
+        const DWORD m_sourceImageSize;
+        const MappingKind m_mapping;
         const ModuleID m_pTargetImage;
+        LPCBYTE m_pbSectionStart;
+        WORD m_numSections;
+        const IMAGE_COR20_HEADER* m_pCorHeader;
     };
 
 }

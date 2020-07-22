@@ -1021,8 +1021,33 @@ HRESULT MicrosoftInstrumentationEngine::CModuleInfo::ImportModule(_In_ IUnknown*
     CComPtr<IMethodMalloc> pTargetMethodMalloc;
     IfFailRet(pRealProfilerInfo2->GetILFunctionBodyAllocator(m_moduleID, &pTargetMethodMalloc));
 
-    AssemblyInjector ai(pRealProfilerInfo2, reinterpret_cast <IMetaDataImport2*>(pSourceModule), pSourceImage, m_pMetadataImport, m_pMetaDataEmit2, m_moduleID, pTargetMethodMalloc);
+    AssemblyInjector ai(pRealProfilerInfo2, reinterpret_cast <IMetaDataImport2*>(pSourceModule), (LPCBYTE)pSourceImage, 0, MappingKind_Image, m_pMetadataImport, m_pMetaDataEmit2, m_moduleID, pTargetMethodMalloc);
     IfFailRet(ai.ImportAll());
+
+    return S_OK;
+#else
+    return E_NOTIMPL;
+#endif
+}
+
+HRESULT MicrosoftInstrumentationEngine::CModuleInfo::ImportType(_In_ LPCBYTE pSourceImage, _In_ DWORD sourceImageSize, _In_ MappingKind mapping, _In_ const WCHAR* typeName)
+{
+#ifdef _WINDOWS_
+    HRESULT hr = S_OK;
+
+    CComPtr<ICorProfilerInfo> pRealProfilerInfo;
+    IfFailRet(m_pProfilerManager->GetRealCorProfilerInfo(&pRealProfilerInfo));
+
+    CComPtr<ICorProfilerInfo2> pRealProfilerInfo2;
+    IfFailRet(pRealProfilerInfo->QueryInterface(__uuidof(ICorProfilerInfo2), reinterpret_cast<void**>(&pRealProfilerInfo2)));
+
+    CComPtr<IMethodMalloc> pTargetMethodMalloc;
+    IfFailRet(pRealProfilerInfo2->GetILFunctionBodyAllocator(m_moduleID, &pTargetMethodMalloc));
+
+    IUnknown* pSourceModule = nullptr;
+
+    AssemblyInjector ai(pRealProfilerInfo2, reinterpret_cast <IMetaDataImport2*>(pSourceModule), pSourceImage, sourceImageSize, mapping, m_pMetadataImport, m_pMetaDataEmit2, m_moduleID, pTargetMethodMalloc);
+    IfFailRet(ai.ImportType(typeName));
 
     return S_OK;
 #else

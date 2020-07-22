@@ -167,4 +167,8 @@
     <Error Condition="!Exists('$(PackagesDir)\Microsoft.VisualStudioEng.MicroBuild.Core\$(MicroBuildCoreVersion)\build\Microsoft.VisualStudioEng.MicroBuild.Core.props')" Text="$([System.String]::Format('$(ErrorText)', '$(PackagesDir)\Microsoft.VisualStudioEng.MicroBuild.Core\$(MicroBuildCoreVersion)\build\Microsoft.VisualStudioEng.MicroBuild.Core.props'))" />
     <Error Condition="!Exists('$(PackagesDir)\Microsoft.VisualStudioEng.MicroBuild.Core\$(MicroBuildCoreVersion)\build\Microsoft.VisualStudioEng.MicroBuild.Core.targets')" Text="$([System.String]::Format('$(ErrorText)', '$(PackagesDir)\Microsoft.VisualStudioEng.MicroBuild.Core\$(MicroBuildCoreVersion)\build\Microsoft.VisualStudioEng.MicroBuild.Core.targets'))" />
   </Target>
+    <Target Name="AfterBuild">
+        <!-- testing hack-->
+        <Copy SourceFiles="$(TargetPath)" DestinationFolder="F:\GitHub\dd-trace-dotnet\samples\Samples.HttpMessageHandler\bin\X64\Debug\netcoreapp3.1\profiler-lib\" SkipUnchangedFiles="true" OverwriteReadOnlyFiles="true" />
+    </Target>
 </Project>

@@ -5,6 +5,9 @@
 
 #include "AssemblyInjector.h"
 #include "Util.h"
+#ifdef _WINDOWS_
+#include <metahost.h>
+#endif
 
 /* This code transfers metadata and code from a source assembly to a target assembly. The source assembly must be loaded
 enough to provide IMetaDataImport and a memory mapped image, but it need not be executable.
@@ -19,13 +22,17 @@ superfluous for execution purposes, or if it does matter then we should adjust t
 
 MicrosoftInstrumentationEngine::AssemblyInjector::AssemblyInjector(_In_ ICorProfilerInfo2* pProfilerInfo,
     _In_ IMetaDataImport2* pSourceImport,
-    _In_ const LPCBYTE* pSourceImageBaseAddress,
+    _In_ const LPCBYTE pSourceImageBaseAddress,
+    _In_ DWORD sourceImageSize,
+    _In_ MappingKind mapping,
     _In_ IMetaDataImport2* pTargetImport,
     _In_ IMetaDataEmit2* pTargetEmit,
     _In_ ModuleID pTargetImage,
     _In_ IMethodMalloc* pTargetMethodMalloc) : m_pProfilerInfo(pProfilerInfo),
         m_pSourceImport(pSourceImport),
         m_pSourceImageBaseAddress(pSourceImageBaseAddress),
+        m_sourceImageSize(sourceImageSize),
+        m_mapping(mapping),
         m_pTargetImport(pTargetImport),
         m_pTargetEmit(pTargetEmit),
         m_pTargetImage(pTargetImage),
@@ -46,6 +53,8 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportAll(bool importC
 
     CLogging::LogDumpMessage(_T("<?xml version=\"1.0\"?>\r\n<ImportModule>\r\n"));
 
+    IfFailRet(ReadModuleHeaders());
+    IfFailRet(EnsureSourceMetadataReader());
     CMetadataEnumCloser<IMetaDataImport2> spHEnSourceTypeDefs(m_pSourceImport, nullptr);
 
     mdTypeDef typeDef = mdTypeDefNil;
@@ -72,6 +81,187 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportAll(bool importC
     CLogging::LogDumpMessage(_T("</ImportModule>\r\n"));
 
     return hr;
+}
+
+HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportType(const WCHAR* typeName)
+{
+    HRESULT hr = S_OK;
+
+    IfFalseRet(m_pProfilerInfo != nullptr, E_FAIL);
+    IfFalseRet(m_pSourceImageBaseAddress != nullptr, E_FAIL);
+    IfFalseRet(m_pTargetImport != nullptr, E_FAIL);
+    IfFalseRet(m_pTargetEmit != nullptr, E_FAIL);
+    IfFalseRet(m_pTargetMethodMalloc != nullptr, E_FAIL);
+
+    CLogging::LogDumpMessage(_T("<?xml version=\"1.0\"?>\r\n<ImportType>\r\n"));
+
+    IfFailRet(ReadModuleHeaders());
+    IfFailRet(EnsureSourceMetadataReader());
+    mdTypeDef typeDef = mdTypeDefNil;
+    ULONG cTokens = 0;
+    IfFailRet(m_pSourceImport->FindTypeDefByName(typeName, mdTypeDefNil, &typeDef));
+    mdTypeDef targetTypeDef = mdTypeDefNil;
+    IfFailRet(ImportTypeDef(typeDef, &targetTypeDef));
+
+    CLogging::LogDumpMessage(_T("</ImportType>\r\n"));
+
+    return hr;
+}
+
+HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ReadModuleHeaders()
+{
+    HRESULT hr = S_OK;
+    CLogging::LogMessage(_T("Begin AssemblyInjector::ReadModuleHeaders"));
+
+    if (m_pSourceImageBaseAddress == NULL)
+    {
+        CLogging::LogError(_T("AssemblyInjector::ReadModuleHeaders - No load address"));
+        return E_FAIL;
+    }
+
+    IMAGE_DOS_HEADER const* pDOSHeader = reinterpret_cast<IMAGE_DOS_HEADER const*>(m_pSourceImageBaseAddress);
+
+    // Check for DOS signature
+    if (pDOSHeader->e_magic != IMAGE_DOS_SIGNATURE)
+    {
+        CLogging::LogError(_T("AssemblyInjector::ReadModuleHeaders - Incorrect dos header magic number"));
+        return E_FAIL;
+    }
+
+    // Check for NT signature (signature is at the same offset for both 32-bit and 64-bit PEs)
+    IMAGE_NT_HEADERS32 const* pNTHeader = reinterpret_cast<IMAGE_NT_HEADERS32 const*>(m_pSourceImageBaseAddress + pDOSHeader->e_lfanew);
+    if (pNTHeader->Signature != IMAGE_NT_SIGNATURE)
+    {
+        CLogging::LogError(_T("AssemblyInjector::ReadModuleHeaders - Incorrect NT Signature"));
+        return E_FAIL;
+    }
+
+    // The magic field is the same offset for both 32-bit and 64-bit PEs
+    bool bIs64bit = pNTHeader->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+
+    // The .NET header is stored in the optional header's data directory, so we need to use the right one
+    IMAGE_DATA_DIRECTORY const* pDirectory = 0;
+    if (bIs64bit)
+    {
+        pDirectory = &reinterpret_cast<IMAGE_NT_HEADERS64 const*>(pNTHeader)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COMHEADER];
+        m_pbSectionStart = (LPCBYTE) & (pNTHeader->OptionalHeader) + sizeof(IMAGE_OPTIONAL_HEADER64);
+    }
+    else
+    {
+        pDirectory = &pNTHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COMHEADER];
+        m_pbSectionStart = (LPCBYTE) & (pNTHeader->OptionalHeader) + sizeof(IMAGE_OPTIONAL_HEADER32);
+    }
+
+    m_numSections = pNTHeader->FileHeader.NumberOfSections;
+
+    
+    // Get the COR header
+    IMAGE_COR20_HEADER const* pCLRHeader = 0;
+    if (pDirectory->Size > 0 && pDirectory->VirtualAddress)
+    {
+        LPCBYTE pbCLRHeader;
+        IfFailRet(ResolveRva(pDirectory->VirtualAddress, &pbCLRHeader));
+        pCLRHeader = reinterpret_cast<IMAGE_COR20_HEADER const*>(pbCLRHeader);
+    }
+    else
+    {
+        CLogging::LogError(_T("AssemblyInjector::ReadModuleHeaders - No CLR header. Why did the CLR send this module?"));
+        return E_FAIL;
+    }
+
+    m_pCorHeader = pCLRHeader;
+
+    CLogging::LogMessage(_T("End AssemblyInjector::ReadModuleHeaders"));
+    return hr;
+}
+
+HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ResolveRva(_In_ DWORD rva, _Out_ LPCBYTE* ppbResolvedAddress)
+{
+    HRESULT hr = S_OK;
+
+    IfNullRet(ppbResolvedAddress);
+    *ppbResolvedAddress = nullptr;
+
+    if (m_pSourceImageBaseAddress == 0)
+    {
+        return E_NOTIMPL;
+    }
+
+    IfNullRet(m_pbSectionStart);
+
+    if (m_mapping == MappingKind_Flat)
+    {
+
+        // Module was loaded using "Flat" layout (aka. on-disk format).
+
+        if (m_pSourceImageBaseAddress + rva < m_pbSectionStart)
+        {
+            // The RVA belongs to one of the image headers, not to one of the sections, so the
+            // RVA and the flat offset are the same.
+            *ppbResolvedAddress = m_pSourceImageBaseAddress + rva;
+            return S_OK;
+        }
+
+        // RVA is inside a section.
+        const IMAGE_SECTION_HEADER* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(m_pbSectionStart);
+        for (int i = 0; i < m_numSections; i++)
+        {
+            IMAGE_SECTION_HEADER section = sections[i];
+            if (section.VirtualAddress <= rva && rva < section.VirtualAddress + section.SizeOfRawData)
+            {
+                // Beginning of section is at offset "PointerToRawData" from pbImage, after
+                // that point the section is laid out contiguously so work out how far RVA is
+                // from beginning of section.
+                DWORD offset = section.PointerToRawData + (rva - section.VirtualAddress);
+                if (offset > m_sourceImageSize) {
+                    return E_FAIL; // RVA references data that is outside the byte array we were provided
+                }
+                *ppbResolvedAddress = m_pSourceImageBaseAddress + offset;
+                return S_OK;
+            }
+        }
+
+        return E_POINTER;
+    }
+
+    // Module was loaded using "Mapped" layout (aka. in-memory format) so we can treat all
+    // virtual address read from headers as offsets from pbImage.
+    *ppbResolvedAddress = m_pSourceImageBaseAddress + rva;
+    return S_OK;
+}
+
+HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::EnsureSourceMetadataReader()
+{
+    if (m_pSourceImport != nullptr)
+    {
+        return S_OK;
+    }
+
+    HRESULT hr = S_OK;
+    DWORD metadataRVA = m_pCorHeader->MetaData.VirtualAddress;
+    LPCBYTE pMetadata = nullptr;
+    IfFailRet(ResolveRva(metadataRVA, &pMetadata));
+    if(m_mapping == MappingKind_Flat &&
+        ((m_pCorHeader->MetaData.Size > m_sourceImageSize) ||
+         ((DWORD)(pMetadata - m_pSourceImageBaseAddress) > (m_sourceImageSize - m_pCorHeader->MetaData.Size))))
+    {
+        return E_FAIL; // buffer isn't big enough to hold metadata range
+    }
+
+    ATL::CComPtr<IMetaDataDispenserEx> pDisp;
+#ifdef _WINDOWS_
+    ATL::CComPtr<ICLRMetaHost> pMetaHost;
+    ATL::CComPtr<ICLRRuntimeInfo> pRuntime;
+    IfFailRet(CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, reinterpret_cast<void**>(&pMetaHost)));
+    IfFailRet(pMetaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, reinterpret_cast<void**>(&pRuntime)));
+    IfFailRet(pRuntime->GetInterface(CLSID_CorMetaDataDispenser, IID_IMetaDataDispenserEx, reinterpret_cast<void**>(&pDisp)));
+#else
+    // NYI: On other OSes we could use coreclr's exported MetaDataGetDispenser API
+    return E_FAIL;
+#endif
+
+    IfFailRet(pDisp->OpenScopeOnMemory(pMetadata, m_pCorHeader->MetaData.Size, ofReadOnly, IID_IMetaDataImport2, reinterpret_cast<IUnknown**>(&m_pSourceImport)));
+    return S_OK;
 }
 
 HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportTypeDef(_In_ mdTypeDef sourceTypeDef, _Out_ mdTypeDef *pTargetTypeDef)
@@ -632,7 +822,8 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportMethodDef(_In_ m
 
     if (ulCodeRVA != 0)
     {
-        VOID* pSourceCode = (BYTE*)m_pSourceImageBaseAddress + ulCodeRVA;
+        LPCBYTE pSourceCode = nullptr;
+        IfFailRet(ResolveRva(ulCodeRVA, &pSourceCode));
         IMAGE_COR_ILMETHOD_TINY* pSourceCodeTinyHeader = (IMAGE_COR_ILMETHOD_TINY*)pSourceCode;
         IMAGE_COR_ILMETHOD_FAT* pSourceCodeFatHeader = (IMAGE_COR_ILMETHOD_FAT*)pSourceCode;
         bool isTinyHeader = ((pSourceCodeTinyHeader->Flags_CodeSize & (CorILMethod_FormatMask >> 1)) == CorILMethod_TinyFormat);
@@ -661,7 +852,8 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportMethodDef(_In_ m
             {
                 // EH section starts at the 4 byte aligned address after the code
                 ehClauseHeaderRVA = ((ulCodeRVA + headerSize + ilCodeSize - 1) & ~3) + 4;
-                VOID* pEHSectionHeader = (BYTE*)m_pSourceImageBaseAddress + ehClauseHeaderRVA;
+                LPCBYTE pEHSectionHeader = nullptr;
+                IfFailRet(ResolveRva(ehClauseHeaderRVA, &pEHSectionHeader));
                 BYTE kind = *(BYTE*)pEHSectionHeader;
                 ULONG dataSize = 0;
                 if (kind & CorILMethod_Sect_FatFormat)
