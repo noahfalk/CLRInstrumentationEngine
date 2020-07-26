@@ -230,6 +230,8 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ResolveRva(_In_ DWORD 
     return S_OK;
 }
 
+typedef HRESULT(*MetaDataGetDispenserFunc)(REFCLSID rclsid, REFIID riid, LPVOID FAR* ppv);
+
 HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::EnsureSourceMetadataReader()
 {
     if (m_pSourceImport != nullptr)
@@ -241,20 +243,36 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::EnsureSourceMetadataRe
     DWORD metadataRVA = m_pCorHeader->MetaData.VirtualAddress;
     LPCBYTE pMetadata = nullptr;
     IfFailRet(ResolveRva(metadataRVA, &pMetadata));
-    if(m_mapping == MappingKind_Flat &&
+    if (m_mapping == MappingKind_Flat &&
         ((m_pCorHeader->MetaData.Size > m_sourceImageSize) ||
-         ((DWORD)(pMetadata - m_pSourceImageBaseAddress) > (m_sourceImageSize - m_pCorHeader->MetaData.Size))))
+            ((DWORD)(pMetadata - m_pSourceImageBaseAddress) > (m_sourceImageSize - m_pCorHeader->MetaData.Size))))
     {
         return E_FAIL; // buffer isn't big enough to hold metadata range
     }
 
     ATL::CComPtr<IMetaDataDispenserEx> pDisp;
 #ifdef _WINDOWS_
-    ATL::CComPtr<ICLRMetaHost> pMetaHost;
-    ATL::CComPtr<ICLRRuntimeInfo> pRuntime;
-    IfFailRet(CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, reinterpret_cast<void**>(&pMetaHost)));
-    IfFailRet(pMetaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, reinterpret_cast<void**>(&pRuntime)));
-    IfFailRet(pRuntime->GetInterface(CLSID_CorMetaDataDispenser, IID_IMetaDataDispenserEx, reinterpret_cast<void**>(&pDisp)));
+    /* TODO: if we knew coreclr was already loaded we could get the metadata dispenser from there
+     * to avoid the perf overhead of loading clr.dll
+    HMODULE hCoreClr = LoadLibrary(L"coreclr.dll");
+    if (hCoreClr != 0)
+    {
+        MetaDataGetDispenserFunc pMetaDataGetDispenser = nullptr;
+        pMetaDataGetDispenser = (MetaDataGetDispenserFunc)GetProcAddress(hCoreClr, "MetaDataGetDispenser");
+        if (pMetaDataGetDispenser != nullptr)
+        {
+            pMetaDataGetDispenser(CLSID_CorMetaDataDispenser, IID_IMetaDataDispenserEx, (void**)&pDisp);
+        }
+    }
+    else // use clr.dll
+    */
+    {
+        ATL::CComPtr<ICLRMetaHost> pMetaHost;
+        ATL::CComPtr<ICLRRuntimeInfo> pRuntime;
+        IfFailRet(CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, reinterpret_cast<void**>(&pMetaHost)));
+        IfFailRet(pMetaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, reinterpret_cast<void**>(&pRuntime)));
+        IfFailRet(pRuntime->GetInterface(CLSID_CorMetaDataDispenser, IID_IMetaDataDispenserEx, reinterpret_cast<void**>(&pDisp)));
+    }
 #else
     // NYI: On other OSes we could use coreclr's exported MetaDataGetDispenser API
     return E_FAIL;
@@ -543,6 +561,10 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportAssemblyRef(_In_
     ULONG cbPublicKeyOrToken = 0;
     WCHAR szName[MAX_NAME] = { 0 };
     ULONG cchName = 0;
+    WCHAR szLocale[MAX_NAME] = { 0 };
+    ASSEMBLYMETADATA assemblyMetadata = { 0 };
+    assemblyMetadata.cbLocale = MAX_NAME;
+    assemblyMetadata.szLocale = szLocale;
     const void* pbHashValue = nullptr;
     ULONG cbHashValue = 0;
     DWORD dwAssemblyRefFlags = 0;
@@ -552,7 +574,7 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportAssemblyRef(_In_
         szName,
         _countof(szName),
         &cchName,
-        nullptr,
+        &assemblyMetadata,
         &pbHashValue,
         &cbHashValue,
         &dwAssemblyRefFlags));
@@ -570,7 +592,7 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportAssemblyRef(_In_
         const void* pbHashValueTarget = nullptr;
         ULONG cbHashValueTarget = 0;
         DWORD dwAssemblyRefFlagsTarget = 0;
-        IfFailRet(pAssemblyImport->GetAssemblyRefProps(cur,
+        IfFailRet(pTargetAssemblyImport->GetAssemblyRefProps(cur,
             &pbPublicKeyOrTokenTarget,
             &cbPublicKeyOrTokenTarget,
             szNameTarget,
@@ -643,8 +665,21 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportAssemblyRef(_In_
         }
     }
 
-    CLogging::LogError(_T("Adding new assembly refs not supported: %s"), szName);
-    return E_NOTIMPL;
+    ATL::CComPtr<IMetaDataAssemblyEmit> pTargetAssemblyEmit;
+    IfFailRet(m_pTargetEmit->QueryInterface(IID_IMetaDataAssemblyEmit, reinterpret_cast<void**>(&pTargetAssemblyEmit)));
+    IfFailRet(pTargetAssemblyEmit->DefineAssemblyRef(
+        pbPublicKeyOrToken,
+        cbPublicKeyOrToken,
+        szName,
+        &assemblyMetadata,
+        pbHashValue,
+        cbHashValue,
+        dwAssemblyRefFlags,
+        pTargetAssemblyScope));
+
+    m_assemblyRefMap[sourceAssemblyRef] = *pTargetAssemblyScope;
+    dumpLogHelper.WriteUlongNode(L"targetToken", *pTargetAssemblyScope);
+    return S_OK;
 }
 HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportFieldDef(_In_ mdFieldDef sourceFieldDef, _Out_ mdFieldDef *pTargetFieldDef)
 {
