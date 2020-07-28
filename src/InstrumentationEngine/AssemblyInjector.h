@@ -68,6 +68,9 @@ namespace MicrosoftInstrumentationEngine
         HRESULT ConvertElemType(_In_ SigParser & sig, _In_ const CComPtr<ISignatureBuilder>& newSig);
         HRESULT ConvertLengthPrefixedDataList(_In_ SigParser & sig, _In_ const CComPtr<ISignatureBuilder>& newSig);
 
+        HRESULT GetCAWithStringParam(mdToken tok, WCHAR* pCAName, WCHAR* pParam, ULONG cbParam);
+        HRESULT GetCAWithStringStringParam(mdToken tok, WCHAR* pCAName, WCHAR* pParam1, ULONG cbParam1, WCHAR* pParam2, ULONG cbParam2);
+
         typedef std::unordered_map<PCCOR_SIGNATURE, CComPtr<ISignatureBuilder>> TSignatureMap;
         TSignatureMap m_sigToConvertedSigMap;
 

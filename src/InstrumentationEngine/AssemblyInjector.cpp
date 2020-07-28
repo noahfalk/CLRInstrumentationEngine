@@ -5,6 +5,7 @@
 
 #include "AssemblyInjector.h"
 #include "Util.h"
+#include "Encoding.h"
 #ifdef _WINDOWS_
 #include <metahost.h>
 #endif
@@ -36,6 +37,9 @@ MicrosoftInstrumentationEngine::AssemblyInjector::AssemblyInjector(_In_ ICorProf
         m_pTargetImport(pTargetImport),
         m_pTargetEmit(pTargetEmit),
         m_pTargetImage(pTargetImage),
+        m_pbSectionStart(0),
+        m_numSections(0),
+        m_pCorHeader(nullptr),
         m_pTargetMethodMalloc(pTargetMethodMalloc)
 {
 }
@@ -253,7 +257,7 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::EnsureSourceMetadataRe
     ATL::CComPtr<IMetaDataDispenserEx> pDisp;
 #ifdef _WINDOWS_
     /* TODO: if we knew coreclr was already loaded we could get the metadata dispenser from there
-     * to avoid the perf overhead of loading clr.dll
+     * to avoid the perf overhead of loading clr.dll */
     HMODULE hCoreClr = LoadLibrary(L"coreclr.dll");
     if (hCoreClr != 0)
     {
@@ -265,7 +269,7 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::EnsureSourceMetadataRe
         }
     }
     else // use clr.dll
-    */
+    
     {
         ATL::CComPtr<ICLRMetaHost> pMetaHost;
         ATL::CComPtr<ICLRRuntimeInfo> pRuntime;
@@ -306,6 +310,44 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportTypeDef(_In_ mdT
 
     dumpLogHelper.WriteStringNode(L"Name", szTypeDef);
 
+    WCHAR szTypeIdentityAssemblyName[MAX_NAME] = { 0 };
+    WCHAR szTypeIdentityTypeName[MAX_NAME] = { 0 };
+    IfFailRet(hr = GetCAWithStringStringParam(sourceTypeDef, L"TypeRefAttribute", szTypeIdentityAssemblyName, _countof(szTypeIdentityAssemblyName),
+        szTypeIdentityTypeName, _countof(szTypeIdentityTypeName)));
+
+    if (szTypeIdentityAssemblyName[0] != 0) {
+        ATL::CComPtr<IMetaDataAssemblyImport> pTargetAssemblyImport;
+        IfFailRet(m_pTargetImport->QueryInterface(IID_IMetaDataAssemblyImport, reinterpret_cast<void**>(&pTargetAssemblyImport)));
+        mdAssembly assemblyTok;
+        IfFailRet(pTargetAssemblyImport->GetAssemblyFromScope(&assemblyTok));
+        WCHAR szTargetAssemblyName[MAX_NAME] = { 0 };
+        IfFailRet(pTargetAssemblyImport->GetAssemblyProps(assemblyTok,
+            nullptr,
+            nullptr,
+            nullptr,
+            szTargetAssemblyName,
+            _countof(szTargetAssemblyName),
+            nullptr,
+            nullptr,
+            nullptr));
+        //TODO: check if szTypeIdentityAssemblyName matches szAssemblyName
+        //If not we are trying to inject a type where it doesn't belong
+        //we should inject Ref tokens instead
+    }
+    BOOL isMergedType = FALSE;
+    WCHAR* pszTargetTypeName = nullptr;
+    if (szTypeIdentityTypeName[0] != 0) {
+        pszTargetTypeName = szTypeIdentityTypeName;
+        isMergedType = TRUE;
+    }
+    else if (szTypeDef[0] == MERGE_TYPE_PREFIX) {
+        pszTargetTypeName = szTypeDef + 1;
+        isMergedType = TRUE;
+    }
+    else {
+        pszTargetTypeName = szTypeDef;
+    }
+
     mdToken targetExtends = mdTokenNil;
     IfFailRet(ConvertToken(tkExtends, &targetExtends));
 
@@ -341,15 +383,15 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportTypeDef(_In_ mdT
     {
         //find matching class by name
         HRESULT hrFound = CLDB_E_RECORD_NOTFOUND;
-        if (szTypeDef[0] == MERGE_TYPE_PREFIX)
+        if (isMergedType)
         {
-            hrFound = m_pTargetImport->FindTypeDefByName(szTypeDef + 1, mdTokenNil, pTargetTypeDef);
-            dumpLogHelper.WriteStringNode(L"MergedToType", szTypeDef + 1);
+            hrFound = m_pTargetImport->FindTypeDefByName(pszTargetTypeName, mdTokenNil, pTargetTypeDef);
+            dumpLogHelper.WriteStringNode(L"MergedToType", pszTargetTypeName);
         }
 
         if (hrFound == CLDB_E_RECORD_NOTFOUND)
         {
-            IfFailRet(m_pTargetEmit->DefineTypeDef(szTypeDef,
+            IfFailRet(m_pTargetEmit->DefineTypeDef(pszTargetTypeName,
                 dwTypeDefFlags,
                 targetExtends,
                 pImplements,
@@ -369,15 +411,15 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportTypeDef(_In_ mdT
 
         //find matching class by name
         HRESULT hrFound = CLDB_E_RECORD_NOTFOUND;
-        if (szTypeDef[0] == MERGE_TYPE_PREFIX)
+        if (isMergedType)
         {
-            hrFound = m_pTargetImport->FindTypeDefByName(szTypeDef + 1, targetEnclosingTypeDef, pTargetTypeDef);
-            dumpLogHelper.WriteStringNode(L"MergedToType", szTypeDef + 1);
+            hrFound = m_pTargetImport->FindTypeDefByName(pszTargetTypeName, targetEnclosingTypeDef, pTargetTypeDef);
+            dumpLogHelper.WriteStringNode(L"MergedToType", pszTargetTypeName);
         }
 
         if (hrFound == CLDB_E_RECORD_NOTFOUND)
         {
-            IfFailRet(m_pTargetEmit->DefineNestedType(szTypeDef,
+            IfFailRet(m_pTargetEmit->DefineNestedType(pszTargetTypeName,
                 dwTypeDefFlags,
                 targetExtends,
                 pImplements,
@@ -794,6 +836,7 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportMethodDef(_In_ m
 
     //this type might already have method def if type was merged. Use existing methods in this situation
     HRESULT hrFound = m_pTargetImport->FindMethod(targetTypeDef, szName, pvSigBlob, cbSigBlob, pTargetMethodDef);
+    mdMethodDef sourceInterceptMethodDef = 0;
     if (hrFound == CLDB_E_RECORD_NOTFOUND)
     {
         IfFailRet(m_pTargetEmit->DefineMethod(targetTypeDef,
@@ -804,6 +847,7 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportMethodDef(_In_ m
             0,
             dwImplFlags,
             pTargetMethodDef));
+
     }
     else if (FAILED(hrFound))
     {
@@ -811,7 +855,26 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ImportMethodDef(_In_ m
     }
     else
     {
+        
         dumpLogHelper.WriteStringNode(L"UseExisting", L"true");
+
+        // search for another method on the same source type that has the Intercept attribute targetting this method
+        CMetadataEnumCloser<IMetaDataImport2> spHCorMethodEnum(m_pSourceImport, nullptr);
+        mdMethodDef curSourceMethod = mdMethodDefNil;
+        ULONG cTokens = 0;
+        while (S_OK == (hr = m_pSourceImport->EnumMethods(spHCorMethodEnum.Get(), tkClass, &curSourceMethod, 1, &cTokens)))
+        {
+            mdMethodDef targetMethodDef = mdMethodDefNil;
+            WCHAR szInterceptMethod[MAX_NAME] = { 0 };
+            IfFailRet(hr = GetCAWithStringParam(curSourceMethod, L"Intercept", szInterceptMethod, _countof(szInterceptMethod)));
+            if (hr == S_OK && wcscmp(szName, szInterceptMethod) == 0)
+            {
+                //TODO validate signature matches
+                sourceInterceptMethodDef = curSourceMethod;
+                break;
+            }
+        }
+        IfFailRet(hr);
     }
 
 
@@ -2064,4 +2127,113 @@ HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::ConvertCustomModSignat
     IfFailRet(ConvertElemType(sig, newSig));
     IfFailRet(ConvertToken(sig, newSig));
     return S_OK;
+}
+
+HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::GetCAWithStringParam(
+    mdToken tok, WCHAR* pCAName, WCHAR* pParam, ULONG cbParam)
+{
+    HRESULT hr = S_OK;
+    ATL::CAutoVectorPtr<mdCustomAttribute> typeCAs;
+    CMetadataEnumCloser<IMetaDataImport2> spHCorCAEnum(m_pSourceImport, nullptr);
+    IfFailRet(hr = m_pSourceImport->EnumCustomAttributes(spHCorCAEnum.Get(), tok, 0, nullptr, 0, nullptr));
+    ULONG ulCount = 0;
+    IfFailRet(hr = m_pSourceImport->CountEnum(*spHCorCAEnum.Get(), &ulCount));
+    if (hr == S_OK && ulCount != 0)
+    {
+        size_t CANameLen = wcslen(pCAName);
+        typeCAs.Attach(new mdCustomAttribute[ulCount]);
+        spHCorCAEnum.Reset(nullptr);
+        IfFailRet(m_pSourceImport->EnumCustomAttributes(spHCorCAEnum.Get(), tok, 0, typeCAs, ulCount, nullptr));
+        for (ULONG i = 0; i < ulCount; i++)
+        {
+            mdToken tkType;
+            const BYTE* pBlob;
+            ULONG cbSize;
+            IfFailRet(m_pSourceImport->GetCustomAttributeProps(typeCAs[i], nullptr, &tkType, (const void**)&pBlob, &cbSize));
+            mdTypeDef attributeTypeDef;
+            IfFailRet(m_pSourceImport->GetMethodProps(tkType, &attributeTypeDef, nullptr, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+            //TODO: verify that the signature is (string)
+            WCHAR szAttributeTypeName[MAX_NAME] = { 0 };
+            ULONG cchAttributeTypeName = 0;
+            IfFailRet(m_pSourceImport->GetTypeDefProps(attributeTypeDef, szAttributeTypeName, _countof(szAttributeTypeName), nullptr, nullptr, nullptr));
+            size_t attrNameLen = wcslen(szAttributeTypeName);
+            if (attrNameLen >= CANameLen && wcscmp(pCAName, szAttributeTypeName + (attrNameLen - CANameLen)) == 0) {
+                // validate prolog
+                if (pBlob[0] != 1 || pBlob[1] != 0) {
+                    return E_FAIL;
+                }
+                // validate first string length
+                ULONG len1 = pBlob[2];
+                if (len1 == 0 || len1 == 0xFF || len1 + 3 >= cbSize) {
+                    return E_FAIL;
+                }
+                if (len1 >= cbParam) {
+                    return E_FAIL;
+                }
+                CA2W ca2w((const char*)pBlob + 3, CP_UTF8);
+                memcpy_s(pParam, cbParam, pBlob + 3, len1 * sizeof(WCHAR));
+                pParam[len1 + 1] = 0;
+                return S_OK;
+            }
+        }
+    }
+    return S_FALSE;
+}
+HRESULT MicrosoftInstrumentationEngine::AssemblyInjector::GetCAWithStringStringParam(
+    mdToken tok, WCHAR* pCAName, WCHAR* pParam1, ULONG cbParam1, WCHAR* pParam2, ULONG cbParam2)
+{
+    HRESULT hr = S_OK;
+    ATL::CAutoVectorPtr<mdCustomAttribute> typeCAs;
+    CMetadataEnumCloser<IMetaDataImport2> spHCorCAEnum(m_pSourceImport, nullptr);
+    IfFailRet(hr = m_pSourceImport->EnumCustomAttributes(spHCorCAEnum.Get(), tok, 0, nullptr, 0, nullptr));
+    ULONG ulCount = 0;
+    IfFailRet(hr = m_pSourceImport->CountEnum(*spHCorCAEnum.Get(), &ulCount));
+    if (hr == S_OK && ulCount != 0)
+    {
+        size_t CANameLen = wcslen(pCAName);
+        typeCAs.Attach(new mdCustomAttribute[ulCount]);
+        spHCorCAEnum.Reset(nullptr);
+        IfFailRet(m_pSourceImport->EnumCustomAttributes(spHCorCAEnum.Get(), tok, 0, typeCAs, ulCount, nullptr));
+        for (ULONG i = 0; i < ulCount; i++)
+        {
+            mdToken tkType;
+            const BYTE* pBlob;
+            ULONG cbSize;
+            IfFailRet(m_pSourceImport->GetCustomAttributeProps(typeCAs[i], nullptr, &tkType, (const void**)&pBlob, &cbSize));
+            mdTypeDef attributeTypeDef;
+            IfFailRet(m_pSourceImport->GetMethodProps(tkType, &attributeTypeDef, nullptr, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+            //TODO: verify that the signature is (string, string)
+            WCHAR szAttributeTypeName[MAX_NAME] = { 0 };
+            ULONG cchAttributeTypeName = 0;
+            IfFailRet(m_pSourceImport->GetTypeDefProps(attributeTypeDef, szAttributeTypeName, _countof(szAttributeTypeName), nullptr, nullptr, nullptr));
+            size_t attrNameLen = wcslen(szAttributeTypeName);
+            if (attrNameLen >= CANameLen && wcscmp(pCAName, szAttributeTypeName + (attrNameLen - CANameLen)) == 0) {
+                // validate prolog
+                if (pBlob[0] != 1 || pBlob[1] != 0) {
+                    return E_FAIL;
+                }
+                // validate first string length
+                ULONG len1 = pBlob[2];
+                if (len1 == 0 || len1 == 0xFF || len1 + 3 >= cbSize) {
+                    return E_FAIL;
+                }
+                // validate 2nd string length
+                ULONG len2 = pBlob[len1 + 3];
+                if (len2 == 0 || len2 == 0xFF || len2 + len1 + 4 >= cbSize) {
+                    return E_FAIL;
+                }
+                if (len1 >= cbParam1 || len2 >= cbParam2) {
+                    return E_FAIL;
+                }
+                CA2W ca2w((const char*)pBlob + 3, CP_UTF8);
+                memcpy_s(pParam1, cbParam1, ca2w, len1 * sizeof(WCHAR));
+                pParam1[len1 + 1] = 0;
+                CA2W ca2w2((const char*)pBlob + len1 + 4, CP_UTF8);
+                memcpy_s(pParam2, cbParam2, ca2w2, len2 * sizeof(WCHAR));
+                pParam2[len2 + 1] = 0;
+                return S_OK;
+            }
+        }
+    }
+    return S_FALSE;
 }
